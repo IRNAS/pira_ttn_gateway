@@ -1,4 +1,3 @@
-FROM resin/%%RESIN_MACHINE_NAME%%-python:latest
 FROM resin/%%RESIN_MACHINE_NAME%%-buildpack-deps
 
 # Switch on systemd init system in container.
@@ -17,6 +16,8 @@ WORKDIR /opt/ttn-gateway/
 RUN chmod +x ./dev/build.sh
 RUN ./dev/build.sh && rm -rf ./dev
 # end ttn-resin-gateway-rpi part
+
+FROM resin/%%RESIN_MACHINE_NAME%%-python:latest
 
 # Set the working directory.
 WORKDIR /usr/src/app
