@@ -14,6 +14,7 @@ COPY . /opt/ttn-gateway/
 WORKDIR /opt/ttn-gateway/
 
 # Build the gateway (or comment this out if debugging on-device)
+RUN chmod +x ./dev/build.sh
 RUN ./dev/build.sh && rm -rf ./dev
 # end ttn-resin-gateway-rpi part
 
@@ -45,4 +46,3 @@ COPY . ./
 
 # Setup entry point.
 CMD ["bash", "start.sh"]
-
