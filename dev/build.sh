@@ -7,9 +7,9 @@ cd $INSTALL_DIR/dev
 
 if [ ! -d wiringPi ]; then
     git clone https://github.com/wiringpi/wiringpi  || { echo 'Cloning wiringPi failed.' ; exit 1; }
-    cd wiringPi
+    cd wiringpi
 else
-    cd wiringPi
+    cd wiringpi
     git reset --hard
     git pull
 fi
