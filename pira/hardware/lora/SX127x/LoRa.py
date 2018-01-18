@@ -21,6 +21,7 @@
 
 
 import sys
+import time
 from .constants import *
 from .board_config import BOARD
 
@@ -83,7 +84,7 @@ class LoRa(object):
 
     def __init__(self, verbose=True, do_calibration=True, calibration_freq=868):
         """ Init the object
-        
+
         Send the device to sleep, read all registers, and do the calibration (if do_calibration=True)
         :param verbose: Set the verbosity True/False
         :param calibration_freq: call rx_chain_calibration with this parameter. Default is 868
@@ -94,6 +95,27 @@ class LoRa(object):
         BOARD.add_events(self._dio0, self._dio1, self._dio2, self._dio3, self._dio4, self._dio5)
         # set mode to sleep and read all registers
         self.set_mode(MODE.SLEEP)
+        returned_mode = self.get_mode()
+
+        #try all modes
+        for mode in MODE:
+            self.set_mode(mode)
+            returned_mode = self.get_mode()
+            if returned_mode & 0b00000110 is not 0:
+                print('LoRa: Entered incorrect mode: 0x%.2x'%(returned_mode))
+                time.sleep(0.05)
+            else:
+                break;
+
+        if returned_mode is 0 :
+            print('LoRa: Failed to configure mode, check HW: 0x%.2x'%(returned_mode))
+            assert False
+        elif returned_mode & 0b00000110 is not 0 :
+            #checking two sleep bytes only
+            print('LoRa: Entered incorrect mode: 0x%.2x'%(returned_mode))
+            assert False
+        else:
+            pass
         self.backup_registers = self.get_all_registers()
         # more setup work:
         if do_calibration:
@@ -229,7 +251,7 @@ class LoRa(object):
         """
         payload_size = len(payload)
         self.set_payload_length(payload_size)
-        
+
         self.set_mode(MODE.STDBY)
         base_addr = self.get_fifo_tx_base_addr()
         self.set_fifo_addr_ptr(base_addr)
@@ -451,12 +473,12 @@ class LoRa(object):
         return self.spi.xfer([REG.LORA.IRQ_FLAGS | 0x80, v])[1]
 
     def clear_irq_flags(self,
-                        RxTimeout=None, RxDone=None, PayloadCrcError=None, 
-                        ValidHeader=None, TxDone=None, CadDone=None, 
+                        RxTimeout=None, RxDone=None, PayloadCrcError=None,
+                        ValidHeader=None, TxDone=None, CadDone=None,
                         FhssChangeChannel=None, CadDetected=None):
         v = 0
-        for i, s in enumerate(['CadDetected', 'FhssChangeChannel', 'CadDone', 
-                                'TxDone', 'ValidHeader', 'PayloadCrcError', 
+        for i, s in enumerate(['CadDetected', 'FhssChangeChannel', 'CadDone',
+                                'TxDone', 'ValidHeader', 'PayloadCrcError',
                                 'RxDone', 'RxTimeout']):
             this_bit = locals()[s]
             if this_bit is not None:
@@ -513,7 +535,7 @@ class LoRa(object):
                 coding_rate = val >> 1 & 0x07,
                 implicit_header_mode = val & 0x01
             )
-        
+
     def set_modem_config_1(self, bw=None, coding_rate=None, implicit_header_mode=None):
         loc = locals()
         current = self.get_modem_config_1()
@@ -537,7 +559,7 @@ class LoRa(object):
 
     def set_implicit_header_mode(self, implicit_header_mode):
         self.set_modem_config_1(implicit_header_mode=implicit_header_mode)
-        
+
     def get_modem_config_2(self, include_symb_timout_lsb=False):
         val = self.spi.xfer([REG.LORA.MODEM_CONFIG_2, 0])[1]
         d = dict(
@@ -548,7 +570,7 @@ class LoRa(object):
         if include_symb_timout_lsb:
             d['symb_timout_lsb'] = val & 0x03
         return d
-        
+
     def set_modem_config_2(self, spreading_factor=None, tx_cont_mode=None, rx_crc=None):
         loc = locals()
         # RegModemConfig2 contains the SymbTimout MSB bits. We tack the back on when writing this register.
@@ -584,7 +606,7 @@ class LoRa(object):
         :return: New value of register
         """
         return 0x27 | (invert & 0x01) << 6
-        
+
     @getter(REG.LORA.INVERT_IQ)
     def get_invert_iq(self, val):
         """ Get the invert the I and Q setting
@@ -628,7 +650,7 @@ class LoRa(object):
         lsb = preamble - msb * 256
         old_msb, old_lsb = self.spi.xfer([REG.LORA.PREAMBLE_MSB | 0x80, msb, lsb])[1:]
         return old_lsb + 256 * old_msb
-        
+
     @getter(REG.LORA.PAYLOAD_LENGTH)
     def get_payload_length(self, val):
         return val

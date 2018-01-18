@@ -9,7 +9,13 @@ import traceback
 
 import RPi.GPIO as gpio
 import pigpio
-import resin
+
+# Optional Resin support.
+try:
+    import resin
+    RESIN_ENABLED = True
+except ImportError:
+    RESIN_ENABLED = False
 
 from .hardware import devices, bq2429x, mcp3021, rtc
 from .state import State
@@ -35,15 +41,19 @@ class Boot(object):
         # the latest values.
         'pira.modules.lora',
         'pira.modules.rockblock',
+        'pira.modules.nodewatcher',
         'pira.modules.debug',
         'pira.modules.webserver',
     ]
 
     def __init__(self):
         self.reason = Boot.BOOT_REASON_UNKNOWN
-        self._resin = resin.Resin()
         self._shutdown = False
         self._charging_status = collections.deque(maxlen=4)
+        self._wifi = None
+
+        if RESIN_ENABLED:
+            self._resin = resin.Resin()
 
     def setup_gpio(self):
         """Initialize GPIO."""
@@ -83,13 +93,21 @@ class Boot(object):
         # Enable wifi.
         print("Enabling wifi.")
         try:
-            self._wifi = subprocess.Popen(["./wifi-connect", "--clear=false"])
+            if RESIN_ENABLED:
+                self._wifi = subprocess.Popen(["./wifi-connect", "--clear=false"])
+            else:
+                subprocess.call(["./scripts/start-networking.sh"])
         except:
             print("ERROR: Failed to start wifi-connect.")
 
     def boot(self):
         """Perform boot sequence."""
         print("Performing boot sequence.")
+
+        if os.environ.get('BOOT_DISABLE', '0') == '1':
+            print("Boot has been disabled (BOOT_DISABLE=1). Not booting further.")
+            while True:
+                time.sleep(1)
 
         self.setup_gpio()
         self.setup_devices()
@@ -123,9 +141,23 @@ class Boot(object):
         # Clear timer and RTC alarms.
         self.clear_alarms()
 
-        # Disable charge timer, configure pre-charge.
-        self.sensor_bq.set_charge_termination(10010010)
-        self.sensor_bq.set_ter_prech_current(1111, 0111)
+        # Disable charge timer, configure pre-charge. THIS IS IMPORTANT
+        # Bit 7 EN_TERM 1 Enabled
+        # Bit 6 Reserved 0
+        #I2C Watchdog Timer Setting - MUST be disabled with 00, otherwise resets
+        #Bit 5 WATCHDOG[1] 0
+        #Bit 4 WATCHDOG[0] 0
+        #Charging Safety Timer Enable - MUST be disabled if device is on permanently
+        #Bit 3 EN_TIMER 0
+        #Bit 2 CHG_TIMER[1] R/W 1
+        #Bit 1 CHG_TIMER[0] R/W 0
+        #Bit 0 Reserved R/W 0
+
+        self.sensor_bq.set_charge_termination(10000010)
+
+        # Precharge must be higher then self-consumption, in multi-cell can be 2A
+        # Termination must be lower then self-consumption
+        self.sensor_bq.set_ter_prech_current(1111, 0001)
 
         # Monitor timer pin and clear alarms while we are running.
         self.pigpio.callback(
@@ -169,7 +201,10 @@ class Boot(object):
             try:
                 module = importlib.import_module(module_name)
             except ImportError:
-                print("  * {} [IMPORT FAILED]".format(module_name))
+                print("ImportError  * {} [IMPORT FAILED]".format(module_name))
+                continue
+            except ValueError:
+                print("ValueError  * {} [IMPORT FAILED]".format(module_name))
                 continue
 
             print("  * {}".format(module.__name__))
@@ -199,6 +234,11 @@ class Boot(object):
             # Store some general log entries.
             self.log.insert(LOG_DEVICE_VOLTAGE, self.sensor_mcp.get_voltage())
             self.log.insert(LOG_DEVICE_TEMPERATURE, self.rtc.temperature)
+
+            # Check if battery voltage is below threshold and shutdown
+            if (self.sensor_mcp.get_voltage() <= os.environ.get('SHUTDOWN_VOLTAGE', '2.6')):
+                print("Voltage is under the threshold, need to shutdown.")
+                self._shutdown = True
 
             # Save state.
             try:
@@ -239,8 +279,24 @@ class Boot(object):
 
     @property
     def is_wifi_enabled(self):
-        enable_when_not_charging = os.environ.get('WIFI_WHEN_NOT_CHARGING', '1') == '1'
-        return self.is_charging or enable_when_not_charging
+        wifi_mode = os.environ.get('WIFI_ENABLE_MODE', 'charging')
+
+        if wifi_mode == 'charging':
+            # Based on charging state.
+            enable_when_not_charging = os.environ.get('WIFI_WHEN_NOT_CHARGING', '1') == '1'
+            return self.is_charging or enable_when_not_charging
+        elif wifi_mode.startswith('gpio:'):
+            # Based on GPIO.
+            try:
+                _, pin = wifi_mode.split(':')
+                pin = int(pin)
+            except ValueError:
+                print("Invalid GPIO pin specified, treating WiFi as always enabled.")
+                return True
+
+            # Read from given GPIO pin.
+            self.pigpio.set_mode(pin, pigpio.INPUT)
+            return self.pigpio.read(pin) == gpio.HIGH
 
     def shutdown(self):
         """Request shutdown."""
@@ -249,12 +305,18 @@ class Boot(object):
 
     def _perform_shutdown(self):
         """Perform shutdown."""
+
+        # If configured to never sleep, then do not go to sleep in any case
+        if self.should_never_sleep:
+            print("Not shutting down as we should never sleep.")
+            return
+
         if self.is_charging and not self.should_sleep_when_charging:
             print("Not shutting down as we are charging and are configured to not sleep when charging.")
             return
 
-        if self.should_never_sleep:
-            print("Not shutting down as we should never sleep.")
+        if self.is_wifi_enabled:
+            print("Not shutting down as WiFi is enabled.")
             return
 
         self.log.insert(LOG_SYSTEM, 'shutdown')
@@ -269,7 +331,8 @@ class Boot(object):
 
         # Shut down devices.
         try:
-            self._wifi.kill()
+            if self._wifi:
+                self._wifi.kill()
         except:
             print("Error while shutting down devices.")
             traceback.print_exc()
@@ -293,13 +356,31 @@ class Boot(object):
 
         self.clear_alarms()
 
-        # Go to sleep if charging is not connected.
-        print('Shutting down as scheduled.')
-        self.pigpio.write(devices.GPIO_SELF_ENABLE_PIN, gpio.LOW)
-        self._resin.models.supervisor.reboot(
-            device_uuid=os.environ['RESIN_DEVICE_UUID'],
-            app_id=os.environ['RESIN_APP_ID']
-        )
+        self.shutdown_strategy = os.environ.get('SHUTDOWN_STRATEGY', 'reboot')
+
+        # Configurable shutdown strategy, shutdown as an option, reboot as default
+
+        if self.shutdown_strategy == 'shutdown':
+            # Shutdown will clear the self-enable pin by default.
+            if RESIN_ENABLED:
+                self._resin.models.supervisor.shutdown(
+                    device_uuid=os.environ['RESIN_DEVICE_UUID'],
+                    app_id=os.environ['RESIN_APP_ID']
+                )
+            else:
+                subprocess.Popen(["/sbin/shutdown", "--poweroff", "now"])
+        else:
+            # Turn off the self-enable pin then reboot as safety if enabled by another source
+            print('Shutting down as scheduled.')
+            self.pigpio.write(devices.GPIO_SELF_ENABLE_PIN, gpio.LOW)
+
+            if RESIN_ENABLED:
+                self._resin.models.supervisor.reboot(
+                    device_uuid=os.environ['RESIN_DEVICE_UUID'],
+                    app_id=os.environ['RESIN_APP_ID']
+                )
+            else:
+                subprocess.Popen(["/sbin/shutdown", "--reboot", "now"])
 
         # Block.
         while True:
